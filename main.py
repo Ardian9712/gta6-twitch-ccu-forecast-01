@@ -7,8 +7,13 @@ donors qualify, relax to 10,000, then all complete launch curves. With no
 history use equal weights. Otherwise use broad Gaussian similarity in log
 hour-1 scale (bandwidth 2) and the preceding 24 hourly log ratios (bandwidth
 1.5). A half-uniform mixture prevents a single neighbour dominating.
-Weighted medians supply the curve. Spread is IQR / 1.349, at least 0.02
-and at least the unweighted IQR calibration: similarity never narrows it.
+Per-hour ridge regressions of log ratios on log hour-1 scale supply the
+curve, with slope shrunk toward zero (unit elasticity in log viewers).
+Spread is IQR / 1.349, at least 0.02 and at least the unweighted IQR
+calibration: similarity never narrows it.
+Internal donor LOO absolute errors divided by their predicted spreads supply
+a pooled 90th-percentile multiplier, floored at one. This widens intervals
+without shifting their medians. Calibration requires five training donors.
 Normal z scores (-1.645, -0.674, 0, 0.674, 1.645) produce five quantiles.
 Only input data affect forecasts; environment variables select I/O paths.
 """
@@ -20,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 NORMAL_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
+CALIBRATION = "pooled"
 
 
 def instant(text):
@@ -100,6 +106,34 @@ def similarity_weights(pool, history, first):
     return weights
 
 
+def curve(pool, history, first):
+    """Regularized local log-log estimates and donor spreads, per hour."""
+    weights = similarity_weights(pool, history, first)
+    equal = [1.0] * len(pool)
+    total = math.fsum(weights)
+    xs = [math.log(values[0] / first) for _, values in pool]
+    mean_x = math.fsum(w * x for w, x in zip(weights, xs)) / total if pool else 0.0
+    variance = math.fsum(w * (x - mean_x) ** 2
+                         for w, x in zip(weights, xs))
+    result = []
+    for hour in range(2, 25):
+        if not pool:
+            result.append((0.0, 0.15 * math.sqrt(hour - 1)))
+            continue
+        ratios = [math.log(values[hour - 1] / values[0]) for _, values in pool]
+        mean_y = math.fsum(w * y for w, y in zip(weights, ratios)) / total
+        covariance = math.fsum(w * (x - mean_x) * (y - mean_y)
+                               for w, x, y in zip(weights, xs, ratios))
+        # Regress log ratios: a zero slope is unit elasticity in log viewers.
+        slope = covariance / (variance + total * 0.5)
+        center = mean_y - slope * mean_x
+        spreads = [(weighted_percentile(ratios, w, 0.75) -
+                    weighted_percentile(ratios, w, 0.25)) / 1.349
+                   for w in (weights, equal)]
+        result.append((center, max(0.02, *spreads)))
+    return result
+
+
 def forecast(case):
     known = next(row for row in case["known"] if row["hour"] == 1)
     first = max(1.0, float(known["viewers"]))
@@ -108,19 +142,11 @@ def forecast(case):
     if not history:
         history = hourly_values(case.get("history"), origin, "at", cutoff=1)
     pool = regime_pool(launch_donors(case.get("comparables", [])))
-    weights = similarity_weights(pool, history, first)
+    prediction = curve(pool, history, first)
+    prediction = calibrate_curve(pool, prediction, CALIBRATION)
     rows = []
     for hour in range(2, 25):
-        if pool:
-            ratios = [math.log(values[hour - 1] / values[0]) for _, values in pool]
-            center = weighted_percentile(ratios, weights, 0.5)
-            equal = [1.0] * len(pool)
-            spreads = [(weighted_percentile(ratios, w, 0.75) -
-                        weighted_percentile(ratios, w, 0.25)) / 1.349
-                       for w in (weights, equal)]
-            spread = max(0.02, *spreads)
-        else:
-            center, spread = 0.0, 0.15 * math.sqrt(hour - 1)
+        center, spread = prediction[hour - 2]
         quantiles = []
         for z_score in NORMAL_SCORES:
             log_value = math.log(first) + center + z_score * spread
@@ -129,6 +155,49 @@ def forecast(case):
                                  min(1e9, value)))
         rows.append({"hour": hour, "q": quantiles})
     return {"hours": rows}
+
+
+def calibration_errors(pool, chronological=False, franchise_key=None):
+    """Internal held-out log errors; never use the outer target's future."""
+    errors = [[] for _ in range(23)]
+    standardized = [[] for _ in range(23)]
+    for target, actual in pool:
+        training = [(source, values) for source, values in pool
+                    if source is not target
+                    and (not chronological or instant(source["day_start"]) < instant(target["day_start"]))
+                    and (franchise_key is None or franchise_key(source["name"]) != franchise_key(target["name"]))]
+        if len(training) < 5:
+            continue
+        history = {hour: value for hour, value in actual.items() if hour <= 0}
+        for offset, (center, spread) in enumerate(curve(training, history, actual[0])):
+            error = abs(math.log(actual[offset+1]/actual[0])-center)
+            errors[offset].append(error)
+            standardized[offset].append(error/spread)
+    return errors, standardized
+
+
+def calibrate_curve(pool, prediction, mode, chronological=False, franchise_key=None):
+    errors, standardized = calibration_errors(pool, chronological, franchise_key)
+    pooled = [value for hour in standardized for value in hour]
+    absolute = [value for hour in errors for value in hour]
+    if not pooled:
+        return prediction
+    def radius(values):
+        return weighted_percentile(values, [1.0]*len(values), .9)/1.645
+    multiplier = max(1.0, radius(pooled))
+    result = []
+    for offset, (center, spread) in enumerate(prediction):
+        if mode == "pooled":
+            spread *= multiplier
+        elif mode == "hour":
+            values = standardized[offset]
+            shrink = len(values)/(len(values)+10.0)
+            local = radius(values) if values else multiplier
+            spread *= max(1.0, shrink*local+(1-shrink)*multiplier)
+        elif mode == "absolute":
+            spread = max(spread, radius(absolute))
+        result.append((center, spread))
+    return result
 
 
 def main():
